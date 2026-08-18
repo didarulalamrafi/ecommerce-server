@@ -23,8 +23,6 @@ app.use(cors());
 
 // UPDATED: পুরো connection URL-ই এখন .env থেকে আসছে, hardcoded নয়
 // .env ফাইলে এভাবে রাখুন (শুধু এই দুইটা লাইনই যথেষ্ট):
-//   MONGODB_URI=mongodb+srv://your_username:your_password@cluster0.rzdpz1j.mongodb.net/maati?appName=Cluster0
-//   PORT=3000
 const uri = process.env.MONGODB_URI;
 
 const client = new MongoClient(uri, {
