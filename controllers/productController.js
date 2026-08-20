@@ -37,9 +37,30 @@ export async function getOne(req, res) {
 }
 
 export async function create(req, res) {
-  const product = { ...req.body, createdAt: new Date() };
+  // NEW: কে বানিয়েছে সেটা সেভ থাকছে — seller নিজের প্রোডাক্ট বাদে অন্যেরটা
+  // এডিট/ডিলিট করতে পারবে না, এই ownership check এর জন্য এই ফিল্ড লাগবে
+  const product = { ...req.body, sellerId: req.user.id, createdAt: new Date() };
   const result = await req.db.collection("products").insertOne(product);
   res.status(201).json({ insertedId: result.insertedId, ...product });
+}
+
+// NEW: seller নিজের dashboard এ শুধু নিজের বানানো প্রোডাক্ট দেখবে
+export async function mine(req, res) {
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+  const skip = (page - 1) * limit;
+
+  const query = { sellerId: req.user.id };
+
+  const [products, total] = await Promise.all([
+    req.db.collection("products").find(query).skip(skip).limit(limit).toArray(),
+    req.db.collection("products").countDocuments(query),
+  ]);
+
+  res.json({
+    products,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+  });
 }
 
 export async function update(req, res) {

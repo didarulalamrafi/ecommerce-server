@@ -52,6 +52,7 @@ async function ensureIndexes(database) {
     await database.collection("orders").createIndex({ userId: 1 });
     await database.collection("orders").createIndex({ createdAt: -1 });
     await database.collection("products").createIndex({ category: 1 });
+    await database.collection("products").createIndex({ sellerId: 1 });
     await database
       .collection("products")
       .createIndex({ name: "text", nameEn: "text" });
