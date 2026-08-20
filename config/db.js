@@ -1,27 +1,27 @@
-const { MongoClient, ServerApiVersion } = require("mongodb");
+// config/db.js
+import { MongoClient, ServerApiVersion } from "mongodb";
 
 const uri = process.env.MONGODB_URI;
 
-const client = new MongoClient(uri, {
+export const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
-    strict: true,
+    // UPDATED: strict:true থাকলে text index তৈরি করা যায় না
+    // ("text indexes cannot be created with apiStrict: true") — তাই বন্ধ
+    strict: false,
     deprecationErrors: true,
   },
-  // serverless এর প্রতিটা instance এর নিজস্ব pool থাকে, তাই খুব বড় না
-  // রেখে explicit রাখা হচ্ছে
   maxPoolSize: 10,
   minPoolSize: 0,
 });
 
-let dbConnectionPromise = null;
+let connectPromise = null;
 
-// Vercel এর প্রতিটা function invocation নতুন execution context এ চলতে
-// পারে। প্রতিবার নতুন connect() না করে, promise cache করে রাখা হচ্ছে,
-// যাতে একই সময়ে অনেক request একসাথে এলেও একবারই connect হয়।
-async function getDB() {
-  if (!dbConnectionPromise) {
-    dbConnectionPromise = client
+// better-auth ও আমাদের নিজেদের collection (products/cart/orders) — দুইটাই
+// একই connected client শেয়ার করবে, তাই connect() একবারই হবে
+export function connectClient() {
+  if (!connectPromise) {
+    connectPromise = client
       .connect()
       .then(async () => {
         console.log("✅ MongoDB-তে সংযোগ সফল হয়েছে!");
@@ -30,20 +30,22 @@ async function getDB() {
         return database;
       })
       .catch((err) => {
-        dbConnectionPromise = null; // ব্যর্থ হলে পরের রিকোয়েস্টে আবার চেষ্টা করবে
+        connectPromise = null;
         console.error("❌ MongoDB সংযোগে সমস্যা:", err);
         throw err;
       });
   }
-  return dbConnectionPromise;
+  return connectPromise;
 }
 
-// প্রয়োজনীয় index — নতুন কোনো index লাগলে এখানে যোগ করবে
+export async function getDB() {
+  return connectClient();
+}
+
+// আমাদের নিজেদের কালেকশনের index — user/session/account better-auth নিজে
+// ম্যানেজ করে, তাই ওগুলোতে হাত দেওয়া হচ্ছে না
 async function ensureIndexes(database) {
   try {
-    await database
-      .collection("users")
-      .createIndex({ email: 1 }, { unique: true });
     await database
       .collection("carts")
       .createIndex({ userId: 1 }, { unique: true });
@@ -61,5 +63,3 @@ async function ensureIndexes(database) {
     console.error("⚠️ Index তৈরিতে সমস্যা:", err.message);
   }
 }
-
-module.exports = { getDB, client };

@@ -722,40 +722,45 @@
 // *********************************************
 
 // ================================================================
-// Maati E-commerce Backend — Express + MongoDB
+// Maati E-commerce Backend — Express + MongoDB + better-auth
 // ================================================================
-// এই ফাইলটা এখন শুধু app setup + route wiring করে। প্রতিটা ফিচারের
-// আসল লজিক controllers/ ফোল্ডারে, রুট ডেফিনিশন routes/ ফোল্ডারে।
-// নতুন ফিচার যোগ করতে হলে: controllers এ ফাংশন লিখো, routes এ রুট
-// বসাও, এখানে router mount করো (যদি নতুন resource হয়)।
+// UPDATED: auth এখন better-auth handle করে (bcrypt/JWT নিজে বানানো কোড
+// বাদ দেওয়া হয়েছে)। ফলে পুরো প্রজেক্ট এখন ESM (import/export) — better-auth
+// এর Express integration CommonJS সাপোর্ট করে না।
+//
+// Auth রুট এখন এইগুলো (better-auth নিজে থেকেই এক্সপোজ করে, আমাদের আলাদা
+// controller লিখতে হয়নি):
+//   POST /api/auth/sign-up/email   → register
+//   POST /api/auth/sign-in/email   → login
+//   POST /api/auth/sign-out        → logout
+//   GET  /api/auth/get-session      → লগইন করা ইউজারের তথ্য
 // ================================================================
 
-const express = require("express");
-const cors = require("cors");
-const cookieParser = require("cookie-parser");
-const helmet = require("helmet");
-const compression = require("compression");
-require("dotenv").config();
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import compression from "compression";
+import { toNodeHandler } from "better-auth/node";
+import "dotenv/config";
 
-const { getDB } = require("./config/db");
-const { apiLimiter } = require("./middlewares/rateLimiter");
-const { notFound, errorHandler } = require("./middlewares/errorHandler");
+import { auth } from "./config/auth.js";
+import { getDB } from "./config/db.js";
+import { apiLimiter } from "./middlewares/rateLimiter.js";
+import { notFound, errorHandler } from "./middlewares/errorHandler.js";
 
-const authRoutes = require("./routes/authRoutes");
-const userRoutes = require("./routes/userRoutes");
-const productRoutes = require("./routes/productRoutes");
-const cartRoutes = require("./routes/cartRoutes");
-const orderRoutes = require("./routes/orderRoutes");
-const miscRoutes = require("./routes/miscRoutes");
+import productRoutes from "./routes/productRoutes.js";
+import cartRoutes from "./routes/cartRoutes.js";
+import orderRoutes from "./routes/orderRoutes.js";
+import miscRoutes from "./routes/miscRoutes.js";
 
 // ----------------------------------------------------------------
-// ENV VALIDATION — জরুরি env var মিসিং থাকলে বুঝিয়ে বলবে
+// ENV VALIDATION
 // ----------------------------------------------------------------
-const REQUIRED_ENV = ["MONGODB_URI", "JWT_SECRET"];
+const REQUIRED_ENV = ["MONGODB_URI", "BETTER_AUTH_SECRET"];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length > 0) {
   console.error(
-    `❌ প্রয়োজনীয় env variable মিসিং: ${missingEnv.join(", ")}। .env ফাইলে সেট করুন (Vercel এ Project Settings > Environment Variables)।`,
+    `❌ প্রয়োজনীয় env variable মিসিং: ${missingEnv.join(", ")}। .env এ সেট করুন (BETTER_AUTH_SECRET বানাতে: openssl rand -base64 32)।`,
   );
   if (process.env.NODE_ENV === "production") {
     throw new Error("Missing required environment variables");
@@ -766,15 +771,21 @@ const app = express();
 const port = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 
-app.set("trust proxy", 1); // Vercel/proxy এর পেছনে secure cookie ঠিকভাবে সেট হতে দরকার
+app.set("trust proxy", 1);
 
 app.use(helmet());
 app.use(compression());
-app.use(express.json({ limit: "1mb" })); // বড় body দিয়ে সার্ভার বসিয়ে দেওয়া ঠেকাতে limit
-app.use(cookieParser());
 app.use(cors({ origin: CLIENT_URL, credentials: true }));
 
-// req.db তে ডাটাবেজ বসিয়ে দেয়, প্রতিটা রুট থেকে req.db ব্যবহার করা যাবে
+// ⚠️ জরুরি: better-auth এর handler express.json() এর *আগে* বসাতে হবে —
+// better-auth নিজেই request body parse করে, express.json() আগে বসালে
+// conflict/bug হবে
+app.all("/api/auth/*splat", toNodeHandler(auth));
+
+// এর পরে বাকি রুটের জন্য normal JSON parsing
+app.use(express.json({ limit: "1mb" }));
+
+// req.db তে ডাটাবেজ বসিয়ে দেয় (product/cart/order রুটের জন্য)
 app.use(async (req, res, next) => {
   try {
     req.db = await getDB();
@@ -788,8 +799,6 @@ app.use("/api", apiLimiter);
 
 app.get("/", (req, res) => res.send("It's ok!"));
 
-app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/orders", orderRoutes);
@@ -798,9 +807,6 @@ app.use("/api", miscRoutes); // /api/categories, /api/newsletter
 app.use(notFound);
 app.use(errorHandler);
 
-// Vercel এ app.listen() কাজ করে না — Vercel নিজেই exported app কে function
-// হিসেবে কল করে। লোকাল ডেভেলপমেন্টে (VERCEL env var না থাকলে) সাধারণ
-// app.listen() দিয়েই চলবে।
 if (!process.env.VERCEL) {
   getDB()
     .then(() => {
@@ -811,4 +817,4 @@ if (!process.env.VERCEL) {
     .catch(() => process.exit(1));
 }
 
-module.exports = app;
+export default app;

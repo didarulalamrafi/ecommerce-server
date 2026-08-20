@@ -1,11 +1,9 @@
-const { ObjectId } = require("mongodb");
+import { ObjectId } from "mongodb";
 
-// pagination + $text search (regex এর বদলে, index-friendly) — product
-// হাজার হাজার হয়ে গেলেও এই ভার্সন স্লো হবে না
-async function list(req, res) {
+export async function list(req, res) {
   const { category, search } = req.query;
   const page = Math.max(parseInt(req.query.page) || 1, 1);
-  const limit = Math.min(parseInt(req.query.limit) || 20, 50); // max 50 capped
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
 
   const query = {};
   if (category) query.category = category;
@@ -24,7 +22,7 @@ async function list(req, res) {
   });
 }
 
-async function getOne(req, res) {
+export async function getOne(req, res) {
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Product id সঠিক নয়" });
@@ -38,13 +36,13 @@ async function getOne(req, res) {
   res.json(product);
 }
 
-async function create(req, res) {
+export async function create(req, res) {
   const product = { ...req.body, createdAt: new Date() };
   const result = await req.db.collection("products").insertOne(product);
   res.status(201).json({ insertedId: result.insertedId, ...product });
 }
 
-async function update(req, res) {
+export async function update(req, res) {
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Product id সঠিক নয়" });
@@ -59,7 +57,7 @@ async function update(req, res) {
   res.json({ message: "প্রোডাক্ট আপডেট হয়েছে" });
 }
 
-async function remove(req, res) {
+export async function remove(req, res) {
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Product id সঠিক নয়" });
@@ -73,9 +71,7 @@ async function remove(req, res) {
   res.json({ message: "প্রোডাক্ট ডিলিট হয়েছে" });
 }
 
-async function categories(req, res) {
+export async function categories(req, res) {
   const cats = await req.db.collection("products").distinct("category");
   res.json(cats);
 }
-
-module.exports = { list, getOne, create, update, remove, categories };

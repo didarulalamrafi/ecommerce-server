@@ -1,61 +1,47 @@
-async function getCart(req, res) {
+export async function checkout(req, res) {
   const cart = await req.db
     .collection("carts")
     .findOne({ userId: req.user.id });
-  res.json(cart?.items || []);
-}
 
-async function addToCart(req, res) {
-  const { productId, name, price, image, qty } = req.body;
-  if (!productId) {
-    return res.status(400).json({ error: "productId দিতে হবে" });
+  if (!cart || cart.items.length === 0) {
+    return res.status(400).json({ error: "কার্ট খালি" });
   }
 
-  // আগে যেভাবে findOne করে জাভাস্ক্রিপ্টে চেক করে তারপর update করা হতো,
-  // সেটায় race condition এর ঝুঁকি ছিল (দুইটা রিকোয়েস্ট একসাথে এলে item
-  // duplicate হয়ে যেতে পারত)। এখন একটামাত্র atomic upsert দিয়ে কাজ চলছে।
-  const updateExisting = await req.db
-    .collection("carts")
-    .updateOne(
-      { userId: req.user.id, "items.productId": productId },
-      { $inc: { "items.$.qty": qty || 1 } },
-    );
+  const total = cart.items.reduce(
+    (sum, item) => sum + item.price * item.qty,
+    0,
+  );
 
-  if (updateExisting.matchedCount === 0) {
-    await req.db
-      .collection("carts")
-      .updateOne(
-        { userId: req.user.id },
-        { $push: { items: { productId, name, price, image, qty: qty || 1 } } },
-        { upsert: true },
-      );
-  }
+  const order = {
+    userId: req.user.id,
+    items: cart.items,
+    total,
+    status: "পেন্ডিং",
+    createdAt: new Date(),
+  };
 
-  res.status(201).json({ message: "কার্টে যোগ হয়েছে" });
-}
+  const result = await req.db.collection("orders").insertOne(order);
 
-async function updateItem(req, res) {
-  const { qty } = req.body;
-  if (!qty || qty < 1) {
-    return res.status(400).json({ error: "সঠিক quantity দিতে হবে" });
-  }
   await req.db
     .collection("carts")
-    .updateOne(
-      { userId: req.user.id, "items.productId": req.params.productId },
-      { $set: { "items.$.qty": qty } },
-    );
-  res.json({ message: "কার্ট আপডেট হয়েছে" });
+    .updateOne({ userId: req.user.id }, { $set: { items: [] } });
+
+  res
+    .status(201)
+    .json({ message: "অর্ডার সম্পন্ন হয়েছে", orderId: result.insertedId });
 }
 
-async function removeItem(req, res) {
-  await req.db
-    .collection("carts")
-    .updateOne(
-      { userId: req.user.id },
-      { $pull: { items: { productId: req.params.productId } } },
-    );
-  res.json({ message: "কার্ট থেকে সরানো হয়েছে" });
-}
+export async function myOrders(req, res) {
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
 
-module.exports = { getCart, addToCart, updateItem, removeItem };
+  const orders = await req.db
+    .collection("orders")
+    .find({ userId: req.user.id })
+    .sort({ createdAt: -1 })
+    .skip((page - 1) * limit)
+    .limit(limit)
+    .toArray();
+
+  res.json(orders);
+}

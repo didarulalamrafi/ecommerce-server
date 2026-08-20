@@ -1,12 +1,10 @@
-async function subscribe(req, res) {
+export async function subscribe(req, res) {
   const { email } = req.body;
   if (!email) {
     return res.status(400).json({ error: "ইমেইল দেওয়া হয়নি" });
   }
   const normalizedEmail = email.trim().toLowerCase();
 
-  // unique index এর উপর ভরসা করে সরাসরি insert — duplicate হলে catch করে
-  // ধরা হচ্ছে, এতে race condition এর ঝুঁকি থাকে না
   try {
     await req.db
       .collection("newsletter")
@@ -19,5 +17,3 @@ async function subscribe(req, res) {
     throw err;
   }
 }
-
-module.exports = { subscribe };

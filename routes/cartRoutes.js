@@ -1,15 +1,15 @@
-const express = require("express");
-const asyncHandler = require("../utils/asyncHandler");
-const { verifyToken } = require("../middlewares/auth");
-const cartController = require("../controllers/cartController");
+import express from "express";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { verifyToken } from "../middlewares/auth.js";
+import * as cartController from "../controllers/cartController.js";
 
 const router = express.Router();
 
-router.use(verifyToken); // এই router এর সব রুট লগইন-প্রোটেক্টেড
+router.use(verifyToken);
 
 router.get("/", asyncHandler(cartController.getCart));
 router.post("/", asyncHandler(cartController.addToCart));
 router.put("/:productId", asyncHandler(cartController.updateItem));
 router.delete("/:productId", asyncHandler(cartController.removeItem));
 
-module.exports = router;
+export default router;

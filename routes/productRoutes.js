@@ -1,15 +1,13 @@
-const express = require("express");
-const asyncHandler = require("../utils/asyncHandler");
-const { verifyToken, verifyAdmin } = require("../middlewares/auth");
-const productController = require("../controllers/productController");
+import express from "express";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { verifyToken, verifyAdmin } from "../middlewares/auth.js";
+import * as productController from "../controllers/productController.js";
 
 const router = express.Router();
 
-// পাবলিক — লগইন লাগবে না
 router.get("/", asyncHandler(productController.list));
 router.get("/:id", asyncHandler(productController.getOne));
 
-// admin-only
 router.post(
   "/",
   verifyToken,
@@ -29,4 +27,4 @@ router.delete(
   asyncHandler(productController.remove),
 );
 
-module.exports = router;
+export default router;
