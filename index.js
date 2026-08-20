@@ -1,570 +1,814 @@
+// // ================================================================
+// // Maati E-commerce Backend — Express + MongoDB
+// // ================================================================
+// // প্রতিটা বড় পরিবর্তনের আগে "// UPDATED:" অথবা "// NEW:" কমেন্ট
+// // দেওয়া আছে, যাতে আপনি সহজে খুঁজে বের করে এডিট করতে পারেন।
+// //
+// // NEW (এই scaling আপডেটে যোগ হয়েছে):
+// //  - Vercel serverless-friendly MongoDB connection (cold-start এ বার বার
+// //    নতুন কানেকশন খুলবে না, cache করে রাখবে)
+// //  - app.listen() এর বদলে module.exports = app (Vercel এর জন্য must)
+// //  - প্রয়োজনীয় সব collection-এ index (email unique, userId, text-search)
+// //  - প্রোডাক্ট লিস্টে pagination + $text search (regex এর বদলে, index-friendly)
+// //  - Auth রুটে rate limiting (brute-force আটকাতে)
+// //  - helmet + compression (security headers + response size কমানো)
+// //  - Cross-domain cookie fix (frontend আর backend আলাদা vercel domain হলে
+// //    sameSite:"lax" কাজ করবে না — production এ "none" + secure:true দরকার)
+// //  - Centralized error handler + asyncHandler wrapper (try/catch বারবার
+// //    লেখা লাগবে না, আর কোনো crash unhandled থাকবে না)
+// //  - .env ভ্যালিডেশন — জরুরি env var মিসিং থাকলে বুঝিয়ে বলবে, চুপচাপ
+// //    fallback secret দিয়ে চলবে না
+// // ================================================================
+
+// const express = require("express");
+// const cors = require("cors");
+// const cookieParser = require("cookie-parser");
+// const bcrypt = require("bcryptjs");
+// const jwt = require("jsonwebtoken");
+// const helmet = require("helmet"); // NEW: npm install helmet
+// const compression = require("compression"); // NEW: npm install compression
+// const rateLimit = require("express-rate-limit"); // NEW: npm install express-rate-limit
+
+// require("dotenv").config();
+
+// const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+
+// // ----------------------------------------------------------------
+// // NEW: ENV VALIDATION — জরুরি env var না থাকলে সার্ভার শুরুর আগেই বলে দেয়
+// // ----------------------------------------------------------------
+// const REQUIRED_ENV = ["MONGODB_URI", "JWT_SECRET"];
+// const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+// if (missingEnv.length > 0) {
+//   console.error(
+//     `❌ প্রয়োজনীয় env variable মিসিং: ${missingEnv.join(", ")}। .env ফাইলে এগুলো সেট করুন (Vercel এ Project Settings > Environment Variables)।`,
+//   );
+//   if (process.env.NODE_ENV === "production") {
+//     // production এ fallback secret দিয়ে চলতে দেওয়া নিরাপদ না
+//     throw new Error("Missing required environment variables");
+//   }
+// }
+
+// const app = express();
+// const port = process.env.PORT || 5000;
+
+// const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
+// const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+// const IS_PROD = process.env.NODE_ENV === "production";
+
+// // NEW: Vercel/যেকোনো proxy এর পেছনে থাকলে এটা লাগবে, নাহলে "secure" কুকি
+// // ঠিকমতো সেট হয় না
+// app.set("trust proxy", 1);
+
+// // NEW: security headers
+// app.use(helmet());
+
+// // NEW: response compress করে দেয়, বিশেষ করে বড় product list এ পার্থক্য বোঝা যায়
+// app.use(compression());
+
+// // UPDATED: বড় body পাঠিয়ে সার্ভার বসিয়ে দেওয়া (DoS) ঠেকাতে limit দেওয়া হলো
+// app.use(express.json({ limit: "1mb" }));
+// app.use(cookieParser());
+
+// app.use(
+//   cors({
+//     origin: CLIENT_URL,
+//     credentials: true,
+//   }),
+// );
+
+// // NEW: auth রুটে rate limit — brute-force login/register আটকাবে
+// const authLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000, // ১৫ মিনিট
+//   max: 30, // প্রতি IP থেকে ১৫ মিনিটে সর্বোচ্চ ৩০ বার
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   message: { error: "অনেকবার চেষ্টা করা হয়েছে, একটু পর আবার চেষ্টা করুন" },
+// });
+
+// // NEW: বাকি সব API তেও একটা general limiter (খুব loose, শুধু abuse ঠেকানোর জন্য)
+// const apiLimiter = rateLimit({
+//   windowMs: 60 * 1000,
+//   max: 200,
+//   standardHeaders: true,
+//   legacyHeaders: false,
+// });
+// app.use("/api", apiLimiter);
+
+// // ----------------------------------------------------------------
+// // UPDATED: SERVERLESS-FRIENDLY MongoDB CONNECTION
+// // ----------------------------------------------------------------
+// // Vercel এর প্রতিটা function invocation নতুন execution context এ চলতে
+// // পারে। যদি প্রতিবার নতুন MongoClient বানানো হয়, অল্প traffic এই MongoDB
+// // Atlas এর connection limit শেষ হয়ে যায়। তাই client টাকে module-level এ
+// // cache করে রাখা হচ্ছে, আর একটা promise cache করে রাখা হচ্ছে যাতে একই
+// // সময়ে একাধিক request এসে একসাথে একাধিক connect() কল না করে।
+// const uri = process.env.MONGODB_URI;
+
+// const client = new MongoClient(uri, {
+//   serverApi: {
+//     version: ServerApiVersion.v1,
+//     strict: true,
+//     deprecationErrors: true,
+//   },
+//   // NEW: connection pool size — serverless এ প্রতিটা instance এর নিজস্ব
+//   // pool থাকে, তাই খুব বড় রাখার দরকার নেই, কিন্তু ডিফল্টের চেয়ে explicit
+//   // রাখা ভালো যাতে হুট করে অনেক connection না খুলে যায়
+//   maxPoolSize: 10,
+//   minPoolSize: 0,
+// });
+
+// let dbConnectionPromise = null;
+
+// async function getDB() {
+//   if (!dbConnectionPromise) {
+//     dbConnectionPromise = client
+//       .connect()
+//       .then(async () => {
+//         console.log("✅ MongoDB-তে সংযোগ সফল হয়েছে!");
+//         const database = client.db("maati");
+//         await ensureIndexes(database);
+//         return database;
+//       })
+//       .catch((err) => {
+//         dbConnectionPromise = null; // ব্যর্থ হলে পরের রিকোয়েস্টে আবার চেষ্টা করবে
+//         console.error("❌ MongoDB সংযোগে সমস্যা:", err);
+//         throw err;
+//       });
+//   }
+//   return dbConnectionPromise;
+// }
+
+// // NEW: প্রতিটা রুটে db লাগে, তাই middleware দিয়ে req.db তে বসিয়ে দেওয়া হচ্ছে
+// app.use(async (req, res, next) => {
+//   try {
+//     req.db = await getDB();
+//     next();
+//   } catch (err) {
+//     res.status(503).json({ error: "ডাটাবেজের সাথে সংযোগ করা যাচ্ছে না" });
+//   }
+// });
+
+// // NEW: প্রয়োজনীয় index তৈরি করে দেয় (প্রথমবার connect হওয়ার সময় একবার চলে)
+// // - users.email: unique, দ্রুত login lookup
+// // - carts.userId, orders.userId: প্রতিটা ইউজারের নিজের ডাটা দ্রুত খুঁজে পেতে
+// // - orders.createdAt: order history sort দ্রুত করতে
+// // - products.category: category filter দ্রুত করতে
+// // - products এ text index: regex এর বদলে $text search ব্যবহার করলে
+// //   হাজার হাজার product হলেও search fast থাকবে (regex বড় ডাটাসেটে স্লো)
+// async function ensureIndexes(database) {
+//   try {
+//     await database
+//       .collection("users")
+//       .createIndex({ email: 1 }, { unique: true });
+//     await database
+//       .collection("carts")
+//       .createIndex({ userId: 1 }, { unique: true });
+//     await database.collection("orders").createIndex({ userId: 1 });
+//     await database.collection("orders").createIndex({ createdAt: -1 });
+//     await database.collection("products").createIndex({ category: 1 });
+//     await database
+//       .collection("products")
+//       .createIndex({ name: "text", nameEn: "text" });
+//     await database
+//       .collection("newsletter")
+//       .createIndex({ email: 1 }, { unique: true });
+//     console.log("✅ Indexes প্রস্তুত");
+//   } catch (err) {
+//     // ইনডেক্স তৈরিতে সমস্যা হলেও সার্ভার বন্ধ হবে না, শুধু লগ করবে
+//     console.error("⚠️ Index তৈরিতে সমস্যা:", err.message);
+//   }
+// }
+
+// // NEW: প্রতিটা async রুট handler কে wrap করে দেয়, যাতে try/catch বারবার
+// // লেখা না লাগে আর কোনো error unhandled promise rejection হয়ে সার্ভার
+// // crash না করায়
+// function asyncHandler(fn) {
+//   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+// }
+
+// // ----------------------------------------------------------------
+// // AUTH HELPERS
+// // ----------------------------------------------------------------
+
+// function sendTokenCookie(res, user) {
+//   const token = jwt.sign(
+//     { id: user._id.toString(), email: user.email, role: user.role },
+//     JWT_SECRET,
+//     { expiresIn: "7d" },
+//   );
+
+//   res.cookie("token", token, {
+//     httpOnly: true,
+//     secure: IS_PROD, // production (HTTPS) এ true
+//     // UPDATED: frontend (ecommerce) আর backend (ecommerce-server) যেহেতু
+//     // আলাদা Vercel domain এ থাকে, sameSite:"lax" cross-site POST/PUT/DELETE
+//     // এ কুকি পাঠাবে না। production এ "none" লাগবে (এর সাথে secure:true
+//     // বাধ্যতামূলক, নাহলে ব্রাউজার কুকি reject করবে)
+//     sameSite: IS_PROD ? "none" : "lax",
+//     maxAge: 7 * 24 * 60 * 60 * 1000,
+//   });
+// }
+
+// function verifyToken(req, res, next) {
+//   const token = req.cookies.token;
+//   if (!token) {
+//     return res.status(401).json({ error: "লগইন করা প্রয়োজন" });
+//   }
+//   try {
+//     req.user = jwt.verify(token, JWT_SECRET);
+//     next();
+//   } catch (err) {
+//     return res
+//       .status(401)
+//       .json({ error: "সেশন মেয়াদোত্তীর্ণ, আবার লগইন করুন" });
+//   }
+// }
+
+// function verifyAdmin(req, res, next) {
+//   if (req.user?.role !== "admin") {
+//     return res
+//       .status(403)
+//       .json({ error: "এই কাজের জন্য admin অ্যাক্সেস লাগবে" });
+//   }
+//   next();
+// }
+
+// // ----------------------------------------------------------------
+// // ROUTES
+// // ----------------------------------------------------------------
+
+// app.get("/", (req, res) => {
+//   res.send("It's ok!");
+// });
+
+// // ================================================================
+// // AUTH ROUTES
+// // ================================================================
+
+// app.post(
+//   "/api/auth/register",
+//   authLimiter,
+//   asyncHandler(async (req, res) => {
+//     const { name, email, password } = req.body;
+//     if (!name || !email || !password) {
+//       return res
+//         .status(400)
+//         .json({ error: "নাম, ইমেইল ও পাসওয়ার্ড দিতে হবে" });
+//     }
+//     // NEW: বেসিক ভ্যালিডেশন — খুব ছোট পাসওয়ার্ড আটকানো ভালো অভ্যাস
+//     if (password.length < 6) {
+//       return res
+//         .status(400)
+//         .json({ error: "পাসওয়ার্ড কমপক্ষে ৬ ক্যারেক্টার হতে হবে" });
+//     }
+
+//     const normalizedEmail = email.trim().toLowerCase();
+
+//     const existing = await req.db
+//       .collection("users")
+//       .findOne({ email: normalizedEmail });
+//     if (existing) {
+//       return res
+//         .status(409)
+//         .json({ error: "এই ইমেইল দিয়ে আগে থেকেই অ্যাকাউন্ট আছে" });
+//     }
+
+//     const hashedPassword = await bcrypt.hash(password, 10);
+
+//     const newUser = {
+//       name,
+//       email: normalizedEmail,
+//       password: hashedPassword,
+//       role: "user",
+//       number: "",
+//       address: "",
+//       bio: "",
+//       createdAt: new Date(),
+//     };
+
+//     const result = await req.db.collection("users").insertOne(newUser);
+//     newUser._id = result.insertedId;
+
+//     sendTokenCookie(res, newUser);
+
+//     res.status(201).json({
+//       message: "রেজিস্ট্রেশন সফল হয়েছে",
+//       user: {
+//         id: newUser._id,
+//         name: newUser.name,
+//         email: newUser.email,
+//         role: newUser.role,
+//       },
+//     });
+//   }),
+// );
+
+// app.post(
+//   "/api/auth/login",
+//   authLimiter,
+//   asyncHandler(async (req, res) => {
+//     const { email, password } = req.body;
+//     if (!email || !password) {
+//       return res.status(400).json({ error: "ইমেইল ও পাসওয়ার্ড দিতে হবে" });
+//     }
+
+//     const normalizedEmail = email.trim().toLowerCase();
+
+//     const user = await req.db
+//       .collection("users")
+//       .findOne({ email: normalizedEmail });
+//     if (!user) {
+//       return res.status(401).json({ error: "ইমেইল বা পাসওয়ার্ড ভুল" });
+//     }
+
+//     const isMatch = await bcrypt.compare(password, user.password);
+//     if (!isMatch) {
+//       return res.status(401).json({ error: "ইমেইল বা পাসওয়ার্ড ভুল" });
+//     }
+
+//     sendTokenCookie(res, user);
+
+//     res.json({
+//       message: "লগইন সফল হয়েছে",
+//       user: {
+//         id: user._id,
+//         name: user.name,
+//         email: user.email,
+//         role: user.role,
+//       },
+//     });
+//   }),
+// );
+
+// app.post("/api/auth/logout", (req, res) => {
+//   res.clearCookie("token", {
+//     httpOnly: true,
+//     secure: IS_PROD,
+//     sameSite: IS_PROD ? "none" : "lax",
+//   });
+//   res.json({ message: "লগআউট সফল হয়েছে" });
+// });
+
+// app.get(
+//   "/api/auth/me",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const user = await req.db
+//       .collection("users")
+//       .findOne(
+//         { _id: new ObjectId(req.user.id) },
+//         { projection: { password: 0 } },
+//       );
+
+//     if (!user) {
+//       return res.status(404).json({ error: "ইউজার পাওয়া যায়নি" });
+//     }
+//     res.json(user);
+//   }),
+// );
+
+// // ================================================================
+// // ইউজার প্রোফাইল রুট
+// // ================================================================
+
+// app.patch(
+//   "/api/users/me",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const { name, number, address, bio } = req.body;
+
+//     await req.db
+//       .collection("users")
+//       .updateOne(
+//         { _id: new ObjectId(req.user.id) },
+//         { $set: { name, number, address, bio } },
+//       );
+
+//     res.json({ message: "প্রোফাইল আপডেট হয়েছে" });
+//   }),
+// );
+
+// // ================================================================
+// // PRODUCT ROUTES
+// // ================================================================
+
+// // UPDATED: pagination + $text search (regex এর বদলে) — প্রোডাক্ট হাজার
+// // হাজার হয়ে গেলেও এই ভার্সন স্লো হবে না, কারণ MongoDB এখন index ব্যবহার
+// // করতে পারবে। limit সর্বোচ্চ ৫০ এ capped, যাতে কেউ ?limit=100000 দিয়ে
+// // পুরো ডাটাবেজ এক রিকোয়েস্টে টেনে সার্ভার ভারী করে ফেলতে না পারে।
+// app.get(
+//   "/api/products",
+//   asyncHandler(async (req, res) => {
+//     const { category, search } = req.query;
+//     const page = Math.max(parseInt(req.query.page) || 1, 1);
+//     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+//     const skip = (page - 1) * limit;
+
+//     const query = {};
+//     if (category) query.category = category;
+//     if (search) query.$text = { $search: search };
+
+//     const [products, total] = await Promise.all([
+//       req.db
+//         .collection("products")
+//         .find(query)
+//         .skip(skip)
+//         .limit(limit)
+//         .toArray(),
+//       req.db.collection("products").countDocuments(query),
+//     ]);
+
+//     res.json({
+//       products,
+//       pagination: {
+//         page,
+//         limit,
+//         total,
+//         totalPages: Math.ceil(total / limit),
+//       },
+//     });
+//   }),
+// );
+
+// app.get(
+//   "/api/products/:id",
+//   asyncHandler(async (req, res) => {
+//     const { id } = req.params;
+//     if (!ObjectId.isValid(id)) {
+//       return res.status(400).json({ error: "Product id সঠিক নয়" });
+//     }
+//     const product = await req.db
+//       .collection("products")
+//       .findOne({ _id: new ObjectId(id) });
+
+//     if (!product) {
+//       return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
+//     }
+//     res.json(product);
+//   }),
+// );
+
+// app.post(
+//   "/api/products",
+//   verifyToken,
+//   verifyAdmin,
+//   asyncHandler(async (req, res) => {
+//     const product = {
+//       ...req.body,
+//       createdAt: new Date(),
+//     };
+//     const result = await req.db.collection("products").insertOne(product);
+//     res.status(201).json({ insertedId: result.insertedId, ...product });
+//   }),
+// );
+
+// app.put(
+//   "/api/products/:id",
+//   verifyToken,
+//   verifyAdmin,
+//   asyncHandler(async (req, res) => {
+//     const { id } = req.params;
+//     if (!ObjectId.isValid(id)) {
+//       return res.status(400).json({ error: "Product id সঠিক নয়" });
+//     }
+//     const result = await req.db
+//       .collection("products")
+//       .updateOne({ _id: new ObjectId(id) }, { $set: req.body });
+
+//     if (result.matchedCount === 0) {
+//       return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
+//     }
+//     res.json({ message: "প্রোডাক্ট আপডেট হয়েছে" });
+//   }),
+// );
+
+// app.delete(
+//   "/api/products/:id",
+//   verifyToken,
+//   verifyAdmin,
+//   asyncHandler(async (req, res) => {
+//     const { id } = req.params;
+//     if (!ObjectId.isValid(id)) {
+//       return res.status(400).json({ error: "Product id সঠিক নয়" });
+//     }
+//     const result = await req.db
+//       .collection("products")
+//       .deleteOne({ _id: new ObjectId(id) });
+
+//     if (result.deletedCount === 0) {
+//       return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
+//     }
+//     res.json({ message: "প্রোডাক্ট ডিলিট হয়েছে" });
+//   }),
+// );
+
+// app.get(
+//   "/api/categories",
+//   asyncHandler(async (req, res) => {
+//     const categories = await req.db.collection("products").distinct("category");
+//     res.json(categories);
+//   }),
+// );
+
+// // ================================================================
+// // CART ROUTES
+// // ================================================================
+
+// app.get(
+//   "/api/cart",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const cart = await req.db
+//       .collection("carts")
+//       .findOne({ userId: req.user.id });
+//     res.json(cart?.items || []);
+//   }),
+// );
+
+// app.post(
+//   "/api/cart",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const { productId, name, price, image, qty } = req.body;
+//     if (!productId) {
+//       return res.status(400).json({ error: "productId দিতে হবে" });
+//     }
+
+//     // UPDATED: আগে findOne করে জাভাস্ক্রিপ্টে চেক করে তারপর updateOne করা
+//     // হতো (দুইটা আলাদা DB round-trip, আর race condition এর ঝুঁকি ছিল —
+//     // দুইটা রিকোয়েস্ট একসাথে এলে item duplicate হয়ে যেতে পারত)। এখন
+//     // একটামাত্র atomic upsert দিয়ে কাজ চলছে।
+//     const updateExisting = await req.db
+//       .collection("carts")
+//       .updateOne(
+//         { userId: req.user.id, "items.productId": productId },
+//         { $inc: { "items.$.qty": qty || 1 } },
+//       );
+
+//     if (updateExisting.matchedCount === 0) {
+//       await req.db.collection("carts").updateOne(
+//         { userId: req.user.id },
+//         {
+//           $push: {
+//             items: { productId, name, price, image, qty: qty || 1 },
+//           },
+//         },
+//         { upsert: true },
+//       );
+//     }
+
+//     res.status(201).json({ message: "কার্টে যোগ হয়েছে" });
+//   }),
+// );
+
+// app.put(
+//   "/api/cart/:productId",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const { qty } = req.body;
+//     if (!qty || qty < 1) {
+//       return res.status(400).json({ error: "সঠিক quantity দিতে হবে" });
+//     }
+//     await req.db
+//       .collection("carts")
+//       .updateOne(
+//         { userId: req.user.id, "items.productId": req.params.productId },
+//         { $set: { "items.$.qty": qty } },
+//       );
+//     res.json({ message: "কার্ট আপডেট হয়েছে" });
+//   }),
+// );
+
+// app.delete(
+//   "/api/cart/:productId",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     await req.db
+//       .collection("carts")
+//       .updateOne(
+//         { userId: req.user.id },
+//         { $pull: { items: { productId: req.params.productId } } },
+//       );
+//     res.json({ message: "কার্ট থেকে সরানো হয়েছে" });
+//   }),
+// );
+
+// // ================================================================
+// // ORDER ROUTES
+// // ================================================================
+
+// app.post(
+//   "/api/orders",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const cart = await req.db
+//       .collection("carts")
+//       .findOne({ userId: req.user.id });
+
+//     if (!cart || cart.items.length === 0) {
+//       return res.status(400).json({ error: "কার্ট খালি" });
+//     }
+
+//     const total = cart.items.reduce(
+//       (sum, item) => sum + item.price * item.qty,
+//       0,
+//     );
+
+//     const order = {
+//       userId: req.user.id,
+//       items: cart.items,
+//       total,
+//       status: "পেন্ডিং",
+//       createdAt: new Date(),
+//     };
+
+//     const result = await req.db.collection("orders").insertOne(order);
+
+//     await req.db
+//       .collection("carts")
+//       .updateOne({ userId: req.user.id }, { $set: { items: [] } });
+
+//     res
+//       .status(201)
+//       .json({ message: "অর্ডার সম্পন্ন হয়েছে", orderId: result.insertedId });
+//   }),
+// );
+
+// // UPDATED: order history তেও pagination — একজন পুরনো ইউজারের শত শত অর্ডার
+// // থাকলে সব একসাথে না টেনে পাতা ধরে আনা হচ্ছে
+// app.get(
+//   "/api/orders/me",
+//   verifyToken,
+//   asyncHandler(async (req, res) => {
+//     const page = Math.max(parseInt(req.query.page) || 1, 1);
+//     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+
+//     const orders = await req.db
+//       .collection("orders")
+//       .find({ userId: req.user.id })
+//       .sort({ createdAt: -1 })
+//       .skip((page - 1) * limit)
+//       .limit(limit)
+//       .toArray();
+//     res.json(orders);
+//   }),
+// );
+
+// app.post(
+//   "/api/newsletter",
+//   asyncHandler(async (req, res) => {
+//     const { email } = req.body;
+//     if (!email) {
+//       return res.status(400).json({ error: "ইমেইল দেওয়া হয়নি" });
+//     }
+//     const normalizedEmail = email.trim().toLowerCase();
+
+//     // UPDATED: আগের মতো findOne + insertOne (দুই ধাপ) না করে, unique index
+//     // এর উপর ভরসা করে সরাসরি insert করা হচ্ছে — duplicate হলে catch করে
+//     // ধরা হচ্ছে। এতে race condition এর ঝুঁকি থাকে না।
+//     try {
+//       await req.db
+//         .collection("newsletter")
+//         .insertOne({ email: normalizedEmail, subscribedAt: new Date() });
+//       res.status(201).json({ message: "সফলভাবে যুক্ত হয়েছেন" });
+//     } catch (err) {
+//       if (err.code === 11000) {
+//         return res.status(200).json({ message: "আপনি আগে থেকেই যুক্ত আছেন" });
+//       }
+//       throw err;
+//     }
+//   }),
+// );
+
+// // ----------------------------------------------------------------
+// // NEW: 404 + CENTRALIZED ERROR HANDLER
+// // ----------------------------------------------------------------
+// // কোনো রুট না মিললে সুন্দর 404, আর asyncHandler থেকে আসা যেকোনো error
+// // এখানে এসে ধরা পড়বে — পুরো সার্ভার crash করবে না, ইউজার একটা readable
+// // error message পাবে।
+// app.use((req, res) => {
+//   res.status(404).json({ error: "রুট পাওয়া যায়নি" });
+// });
+
+// app.use((err, req, res, next) => {
+//   console.error("❌ Unhandled error:", err);
+//   res.status(500).json({
+//     error: "সার্ভারে সমস্যা হয়েছে",
+//     details: IS_PROD ? undefined : err.message,
+//   });
+// });
+
+// // ----------------------------------------------------------------
+// // UPDATED: SERVER START — Vercel serverless vs লোকাল ডেভেলপমেন্ট
+// // ----------------------------------------------------------------
+// // Vercel এ app.listen() কাজ করে না — Vercel নিজেই request handle করার
+// // জন্য exported app কে function হিসেবে কল করে। তাই module.exports = app
+// // থাকতে হবে। লোকালে ডেভেলপ করার সময় (VERCEL env var না থাকলে) সাধারণ
+// // app.listen() দিয়েই চলবে।
+// if (!process.env.VERCEL) {
+//   getDB()
+//     .then(() => {
+//       app.listen(port, () => {
+//         console.log(`🚀 Server চলছে: http://localhost:${port}`);
+//       });
+//     })
+//     .catch(() => process.exit(1));
+// }
+
+// module.exports = app;
+
+// ********************************************
+// New Code, redesinged
+// *********************************************
+
 // ================================================================
 // Maati E-commerce Backend — Express + MongoDB
 // ================================================================
-// প্রতিটা বড় পরিবর্তনের আগে "// UPDATED:" অথবা "// NEW:" কমেন্ট
-// দেওয়া আছে, যাতে আপনি সহজে খুঁজে বের করে এডিট করতে পারেন।
-//
-// NEW (এই আপডেটে যোগ হয়েছে):
-//  - ইউজার রেজিস্টার/লগইন/লগআউট (JWT দিয়ে, httpOnly কুকিতে টোকেন থাকবে)
-//  - verifyToken ও verifyAdmin মিডলওয়্যার — লগইন ছাড়া ড্যাশবোর্ড/কার্ট/অর্ডার
-//    এক্সেস করা যাবে না, আর প্রোডাক্ট Add/Edit/Delete শুধু admin করতে পারবে
-//  - প্রোডাক্ট দেখা (GET) সবার জন্য ওপেন থাকছে, লগইন লাগবে না
-//  - কার্ট (add/update/remove) ও অর্ডার — শুধু লগইন করা ইউজার করতে পারবে
+// এই ফাইলটা এখন শুধু app setup + route wiring করে। প্রতিটা ফিচারের
+// আসল লজিক controllers/ ফোল্ডারে, রুট ডেফিনিশন routes/ ফোল্ডারে।
+// নতুন ফিচার যোগ করতে হলে: controllers এ ফাংশন লিখো, routes এ রুট
+// বসাও, এখানে router mount করো (যদি নতুন resource হয়)।
 // ================================================================
 
 const express = require("express");
 const cors = require("cors");
-const cookieParser = require("cookie-parser"); // NEW: কুকি পড়ার জন্য — npm install cookie-parser
-const bcrypt = require("bcryptjs"); // NEW: পাসওয়ার্ড হ্যাশ করার জন্য — npm install bcryptjs
-const jwt = require("jsonwebtoken"); // NEW: লগইন টোকেন বানানোর জন্য — npm install jsonwebtoken
-
+const cookieParser = require("cookie-parser");
+const helmet = require("helmet");
+const compression = require("compression");
 require("dotenv").config();
 
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const { getDB } = require("./config/db");
+const { apiLimiter } = require("./middlewares/rateLimiter");
+const { notFound, errorHandler } = require("./middlewares/errorHandler");
+
+const authRoutes = require("./routes/authRoutes");
+const userRoutes = require("./routes/userRoutes");
+const productRoutes = require("./routes/productRoutes");
+const cartRoutes = require("./routes/cartRoutes");
+const orderRoutes = require("./routes/orderRoutes");
+const miscRoutes = require("./routes/miscRoutes");
+
+// ----------------------------------------------------------------
+// ENV VALIDATION — জরুরি env var মিসিং থাকলে বুঝিয়ে বলবে
+// ----------------------------------------------------------------
+const REQUIRED_ENV = ["MONGODB_URI", "JWT_SECRET"];
+const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missingEnv.length > 0) {
+  console.error(
+    `❌ প্রয়োজনীয় env variable মিসিং: ${missingEnv.join(", ")}। .env ফাইলে সেট করুন (Vercel এ Project Settings > Environment Variables)।`,
+  );
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("Missing required environment variables");
+  }
+}
 
 const app = express();
 const port = process.env.PORT || 5000;
-
-// NEW: JWT সাইন করার জন্য সিক্রেট — অবশ্যই .env ফাইলে JWT_SECRET=যেকোনো_লম্বা_র‍্যান্ডম_স্ট্রিং দিন
-const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
-
-// NEW: ফ্রন্টএন্ডের URL — .env এ CLIENT_URL=http://localhost:3000 না দিলে এটাই ডিফল্ট হবে
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 
-app.use(express.json());
-app.use(cookieParser()); // NEW: req.cookies পড়তে লাগবে
+app.set("trust proxy", 1); // Vercel/proxy এর পেছনে secure cookie ঠিকভাবে সেট হতে দরকার
 
-// UPDATED: আগে app.use(cors()) ছিল যা wildcard origin ব্যবহার করে —
-// কিন্তু কুকি (credentials) পাঠাতে হলে wildcard origin চলবে না,
-// তাই নির্দিষ্ট origin + credentials: true দেওয়া হলো
-app.use(
-  cors({
-    origin: CLIENT_URL,
-    credentials: true,
-  }),
-);
+app.use(helmet());
+app.use(compression());
+app.use(express.json({ limit: "1mb" })); // বড় body দিয়ে সার্ভার বসিয়ে দেওয়া ঠেকাতে limit
+app.use(cookieParser());
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
 
-const uri = process.env.MONGODB_URI;
-
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
-let db;
-
-async function connectDB() {
+// req.db তে ডাটাবেজ বসিয়ে দেয়, প্রতিটা রুট থেকে req.db ব্যবহার করা যাবে
+app.use(async (req, res, next) => {
   try {
-    await client.connect();
-    await client.db("admin").command({ ping: 1 });
-    console.log("✅ MongoDB-তে সংযোগ সফল হয়েছে!");
-    db = client.db("maati");
-  } catch (err) {
-    console.error("❌ MongoDB সংযোগে সমস্যা:", err);
-    process.exit(1);
-  }
-}
-
-// ----------------------------------------------------------------
-// NEW: AUTH HELPERS
-// ----------------------------------------------------------------
-
-// টোকেন বানিয়ে httpOnly কুকিতে বসিয়ে দেয় — ব্রাউজার নিজে থেকেই এই কুকি
-// পরের প্রতিটা রিকোয়েস্টের সাথে পাঠাবে (frontend-এ credentials: "include" থাকতে হবে)
-function sendTokenCookie(res, user) {
-  const token = jwt.sign(
-    { id: user._id.toString(), email: user.email, role: user.role },
-    JWT_SECRET,
-    { expiresIn: "7d" },
-  );
-
-  res.cookie("token", token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production", // প্রোডাকশনে (HTTPS) true হতে হবে
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // ৭ দিন
-  });
-}
-
-// এই মিডলওয়্যার যেকোনো রুটের আগে বসালে সেই রুট শুধু লগইন করা ইউজার এক্সেস করতে পারবে
-function verifyToken(req, res, next) {
-  const token = req.cookies.token;
-  if (!token) {
-    return res.status(401).json({ error: "লগইন করা প্রয়োজন" });
-  }
-  try {
-    req.user = jwt.verify(token, JWT_SECRET); // { id, email, role }
+    req.db = await getDB();
     next();
   } catch (err) {
-    return res
-      .status(401)
-      .json({ error: "সেশন মেয়াদোত্তীর্ণ, আবার লগইন করুন" });
-  }
-}
-
-// verifyToken এর পরে বসাতে হয় — শুধু admin role এর ইউজার পাস করতে পারবে
-function verifyAdmin(req, res, next) {
-  if (req.user?.role !== "admin") {
-    return res
-      .status(403)
-      .json({ error: "এই কাজের জন্য admin অ্যাক্সেস লাগবে" });
-  }
-  next();
-}
-
-// ----------------------------------------------------------------
-// ROUTES
-// ----------------------------------------------------------------
-
-app.get("/", (req, res) => {
-  res.send("It's ok!");
-});
-
-// ================================================================
-// NEW: AUTH ROUTES
-// ================================================================
-
-// রেজিস্টার — নতুন ইউজার তৈরি, ডিফল্ট role "user"
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res
-        .status(400)
-        .json({ error: "নাম, ইমেইল ও পাসওয়ার্ড দিতে হবে" });
-    }
-
-    const existing = await db.collection("users").findOne({ email });
-    if (existing) {
-      return res
-        .status(409)
-        .json({ error: "এই ইমেইল দিয়ে আগে থেকেই অ্যাকাউন্ট আছে" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // TODO: প্রথম admin বানাতে চাইলে — MongoDB Atlas-এ গিয়ে ম্যানুয়ালি
-    // সেই ইউজারের role: "user" থেকে role: "admin" করে দিন
-    const newUser = {
-      name,
-      email,
-      password: hashedPassword,
-      role: "user",
-      number: "",
-      address: "",
-      bio: "",
-      createdAt: new Date(),
-    };
-
-    const result = await db.collection("users").insertOne(newUser);
-    newUser._id = result.insertedId;
-
-    sendTokenCookie(res, newUser);
-
-    res.status(201).json({
-      message: "রেজিস্ট্রেশন সফল হয়েছে",
-      user: {
-        id: newUser._id,
-        name: newUser.name,
-        email: newUser.email,
-        role: newUser.role,
-      },
-    });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "রেজিস্ট্রেশন করা যায়নি", details: err.message });
+    res.status(503).json({ error: "ডাটাবেজের সাথে সংযোগ করা যাচ্ছে না" });
   }
 });
 
-// লগইন
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: "ইমেইল ও পাসওয়ার্ড দিতে হবে" });
-    }
+app.use("/api", apiLimiter);
 
-    const user = await db.collection("users").findOne({ email });
-    if (!user) {
-      return res.status(401).json({ error: "ইমেইল বা পাসওয়ার্ড ভুল" });
-    }
+app.get("/", (req, res) => res.send("It's ok!"));
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ error: "ইমেইল বা পাসওয়ার্ড ভুল" });
-    }
+app.use("/api/auth", authRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/products", productRoutes);
+app.use("/api/cart", cartRoutes);
+app.use("/api/orders", orderRoutes);
+app.use("/api", miscRoutes); // /api/categories, /api/newsletter
 
-    sendTokenCookie(res, user);
+app.use(notFound);
+app.use(errorHandler);
 
-    res.json({
-      message: "লগইন সফল হয়েছে",
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ error: "লগইন করা যায়নি", details: err.message });
-  }
-});
-
-// লগআউট — কুকি মুছে দেয়
-app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("token");
-  res.json({ message: "লগআউট সফল হয়েছে" });
-});
-
-// লগইন করা ইউজারের তথ্য — Navbar/Dashboard এ কে লগইন আছে কিনা চেক করতে এটা কল হবে
-app.get("/api/auth/me", verifyToken, async (req, res) => {
-  try {
-    const user = await db
-      .collection("users")
-      .findOne(
-        { _id: new ObjectId(req.user.id) },
-        { projection: { password: 0 } },
-      );
-
-    if (!user) {
-      return res.status(404).json({ error: "ইউজার পাওয়া যায়নি" });
-    }
-    res.json(user);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "তথ্য লোড করা যায়নি", details: err.message });
-  }
-});
-
-// ================================================================
-// NEW: ইউজার প্রোফাইল রুট (নাম, নাম্বার, ঠিকানা, বায়ো এডিট)
-// ================================================================
-
-app.patch("/api/users/me", verifyToken, async (req, res) => {
-  try {
-    // ইমেইল/পাসওয়ার্ড/role এখান থেকে বদলানো যাবে না — শুধু প্রোফাইল ইনফো
-    const { name, number, address, bio } = req.body;
-
-    await db
-      .collection("users")
-      .updateOne(
-        { _id: new ObjectId(req.user.id) },
-        { $set: { name, number, address, bio } },
-      );
-
-    res.json({ message: "প্রোফাইল আপডেট হয়েছে" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোফাইল আপডেট করা যায়নি", details: err.message });
-  }
-});
-
-// ================================================================
-// PRODUCT ROUTES
-// ================================================================
-
-// প্রোডাক্ট লিস্ট — সবার জন্য ওপেন, লগইন লাগবে না
-app.get("/api/products", async (req, res) => {
-  try {
-    const { category, search } = req.query;
-    const query = {};
-
-    if (category) query.category = category;
-    if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { nameEn: { $regex: search, $options: "i" } },
-      ];
-    }
-
-    const products = await db.collection("products").find(query).toArray();
-    res.json(products);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোডাক্ট লোড করা যায়নি", details: err.message });
-  }
-});
-
-// একটা প্রোডাক্টের ডিটেইলস — এটাও সবার জন্য ওপেন (প্রোডাক্ট ডিটেইলস পেজের জন্য)
-app.get("/api/products/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Product id সঠিক নয়" });
-    }
-    const product = await db
-      .collection("products")
-      .findOne({ _id: new ObjectId(id) });
-
-    if (!product) {
-      return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
-    }
-    res.json(product);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোডাক্ট লোড করা যায়নি", details: err.message });
-  }
-});
-
-// UPDATED: এখন শুধু admin প্রোডাক্ট যোগ করতে পারবে (verifyToken + verifyAdmin)
-app.post("/api/products", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const product = {
-      ...req.body,
-      createdAt: new Date(),
-    };
-    const result = await db.collection("products").insertOne(product);
-    res.status(201).json({ insertedId: result.insertedId, ...product });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোডাক্ট যোগ করা যায়নি", details: err.message });
-  }
-});
-
-// UPDATED: শুধু admin প্রোডাক্ট এডিট করতে পারবে
-app.put("/api/products/:id", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Product id সঠিক নয়" });
-    }
-    const result = await db
-      .collection("products")
-      .updateOne({ _id: new ObjectId(id) }, { $set: req.body });
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
-    }
-    res.json({ message: "প্রোডাক্ট আপডেট হয়েছে" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোডাক্ট আপডেট করা যায়নি", details: err.message });
-  }
-});
-
-// UPDATED: শুধু admin প্রোডাক্ট ডিলিট করতে পারবে
-app.delete("/api/products/:id", verifyToken, verifyAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: "Product id সঠিক নয়" });
-    }
-    const result = await db
-      .collection("products")
-      .deleteOne({ _id: new ObjectId(id) });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
-    }
-    res.json({ message: "প্রোডাক্ট ডিলিট হয়েছে" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "প্রোডাক্ট ডিলিট করা যায়নি", details: err.message });
-  }
-});
-
-app.get("/api/categories", async (req, res) => {
-  try {
-    const categories = await db.collection("products").distinct("category");
-    res.json(categories);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "ক্যাটাগরি লোড করা যায়নি", details: err.message });
-  }
-});
-
-// ================================================================
-// NEW: CART ROUTES — সব লগইন-প্রোটেক্টেড (verifyToken)
-// প্রতিটা ইউজারের কার্ট একটাই ডকুমেন্ট, userId দিয়ে খোঁজা হয়
-// ================================================================
-
-// কার্ট দেখা
-app.get("/api/cart", verifyToken, async (req, res) => {
-  try {
-    const cart = await db.collection("carts").findOne({ userId: req.user.id });
-    res.json(cart?.items || []);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "কার্ট লোড করা যায়নি", details: err.message });
-  }
-});
-
-// কার্টে প্রোডাক্ট যোগ করা — আগে থেকে থাকলে qty বাড়িয়ে দেয়
-app.post("/api/cart", verifyToken, async (req, res) => {
-  try {
-    const { productId, name, price, image, qty } = req.body;
-
-    const cart = await db.collection("carts").findOne({ userId: req.user.id });
-
-    if (!cart) {
-      await db.collection("carts").insertOne({
-        userId: req.user.id,
-        items: [{ productId, name, price, image, qty: qty || 1 }],
+// Vercel এ app.listen() কাজ করে না — Vercel নিজেই exported app কে function
+// হিসেবে কল করে। লোকাল ডেভেলপমেন্টে (VERCEL env var না থাকলে) সাধারণ
+// app.listen() দিয়েই চলবে।
+if (!process.env.VERCEL) {
+  getDB()
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`🚀 Server চলছে: http://localhost:${port}`);
       });
-    } else {
-      const existingItem = cart.items.find((i) => i.productId === productId);
+    })
+    .catch(() => process.exit(1));
+}
 
-      if (existingItem) {
-        await db
-          .collection("carts")
-          .updateOne(
-            { userId: req.user.id, "items.productId": productId },
-            { $inc: { "items.$.qty": qty || 1 } },
-          );
-      } else {
-        await db
-          .collection("carts")
-          .updateOne(
-            { userId: req.user.id },
-            {
-              $push: {
-                items: { productId, name, price, image, qty: qty || 1 },
-              },
-            },
-          );
-      }
-    }
-
-    res.status(201).json({ message: "কার্টে যোগ হয়েছে" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "কার্টে যোগ করা যায়নি", details: err.message });
-  }
-});
-
-// কার্টের কোনো আইটেমের quantity বদলানো
-app.put("/api/cart/:productId", verifyToken, async (req, res) => {
-  try {
-    const { qty } = req.body;
-    await db
-      .collection("carts")
-      .updateOne(
-        { userId: req.user.id, "items.productId": req.params.productId },
-        { $set: { "items.$.qty": qty } },
-      );
-    res.json({ message: "কার্ট আপডেট হয়েছে" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "কার্ট আপডেট করা যায়নি", details: err.message });
-  }
-});
-
-// কার্ট থেকে একটা আইটেম সরানো
-app.delete("/api/cart/:productId", verifyToken, async (req, res) => {
-  try {
-    await db
-      .collection("carts")
-      .updateOne(
-        { userId: req.user.id },
-        { $pull: { items: { productId: req.params.productId } } },
-      );
-    res.json({ message: "কার্ট থেকে সরানো হয়েছে" });
-  } catch (err) {
-    res.status(500).json({ error: "সরানো যায়নি", details: err.message });
-  }
-});
-
-// ================================================================
-// NEW: ORDER ROUTES — লগইন-প্রোটেক্টেড
-// ================================================================
-
-// চেকআউট — কার্ট থেকে অর্ডার তৈরি হয়, তারপর কার্ট খালি হয়ে যায়
-app.post("/api/orders", verifyToken, async (req, res) => {
-  try {
-    const cart = await db.collection("carts").findOne({ userId: req.user.id });
-
-    if (!cart || cart.items.length === 0) {
-      return res.status(400).json({ error: "কার্ট খালি" });
-    }
-
-    const total = cart.items.reduce(
-      (sum, item) => sum + item.price * item.qty,
-      0,
-    );
-
-    const order = {
-      userId: req.user.id,
-      items: cart.items,
-      total,
-      status: "পেন্ডিং",
-      createdAt: new Date(),
-    };
-
-    const result = await db.collection("orders").insertOne(order);
-
-    // অর্ডার হয়ে গেলে কার্ট খালি করে দেওয়া হচ্ছে
-    await db
-      .collection("carts")
-      .updateOne({ userId: req.user.id }, { $set: { items: [] } });
-
-    res
-      .status(201)
-      .json({ message: "অর্ডার সম্পন্ন হয়েছে", orderId: result.insertedId });
-  } catch (err) {
-    res.status(500).json({ error: "অর্ডার করা যায়নি", details: err.message });
-  }
-});
-
-// লগইন করা ইউজারের নিজের অর্ডার হিস্টরি
-app.get("/api/orders/me", verifyToken, async (req, res) => {
-  try {
-    const orders = await db
-      .collection("orders")
-      .find({ userId: req.user.id })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.json(orders);
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "অর্ডার হিস্টরি লোড করা যায়নি", details: err.message });
-  }
-});
-
-app.post("/api/newsletter", async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ error: "ইমেইল দেওয়া হয়নি" });
-    }
-
-    const existing = await db.collection("newsletter").findOne({ email });
-    if (existing) {
-      return res.status(200).json({ message: "আপনি আগে থেকেই যুক্ত আছেন" });
-    }
-
-    await db
-      .collection("newsletter")
-      .insertOne({ email, subscribedAt: new Date() });
-    res.status(201).json({ message: "সফলভাবে যুক্ত হয়েছেন" });
-  } catch (err) {
-    res
-      .status(500)
-      .json({ error: "সাবস্ক্রাইব করা যায়নি", details: err.message });
-  }
-});
-
-// ----------------------------------------------------------------
-// SERVER START
-// ----------------------------------------------------------------
-
-connectDB().then(() => {
-  app.listen(port, () => {
-    console.log(`🚀 Server চলছে: http://localhost:${port}`);
-  });
-});
+module.exports = app;
