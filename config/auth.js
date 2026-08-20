@@ -43,14 +43,15 @@ export const auth = betterAuth({
   // এখন better-auth এর user document এই থাকবে, আলাদা কালেকশন লাগবে না
   user: {
     additionalFields: {
-      role: {
-        type: "string",
-        defaultValue: "user",
-        input: false, // ইউজার সাইনআপের সময় নিজে থেকে "admin" বসাতে পারবে না
-      },
       number: { type: "string", required: false },
       address: { type: "string", required: false },
       bio: { type: "string", required: false },
+      role: {
+        type: "string",
+        required: false,
+        defaultValue: "user", // নতুন সাইনআপ ডিফল্ট "user"
+        input: false, // ইউজার নিজে role সেট করতে পারবে না (security)
+      },
     },
   },
 
