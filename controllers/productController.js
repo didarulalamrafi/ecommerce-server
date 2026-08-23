@@ -27,14 +27,14 @@ export async function list(req, res) {
   });
 }
 
+// ✅ একটাই getOne — ObjectId অথবা slug দুটো দিয়েই প্রোডাক্ট খোঁজা যাবে
 export async function getOne(req, res) {
   const { id } = req.params;
-  if (!ObjectId.isValid(id)) {
-    return res.status(400).json({ error: "Product id সঠিক নয়" });
-  }
-  const product = await req.db
-    .collection("products")
-    .findOne({ _id: new ObjectId(id) });
+
+  const query = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { slug: id };
+
+  const product = await req.db.collection("products").findOne(query);
+
   if (!product) {
     return res.status(404).json({ error: "প্রোডাক্ট পাওয়া যায়নি" });
   }

@@ -724,16 +724,11 @@
 // ================================================================
 // Maati E-commerce Backend — Express + MongoDB + better-auth
 // ================================================================
-// UPDATED: auth এখন better-auth handle করে (bcrypt/JWT নিজে বানানো কোড
-// বাদ দেওয়া হয়েছে)। ফলে পুরো প্রজেক্ট এখন ESM (import/export) — better-auth
-// এর Express integration CommonJS সাপোর্ট করে না।
-//
-// Auth রুট এখন এইগুলো (better-auth নিজে থেকেই এক্সপোজ করে, আমাদের আলাদা
-// controller লিখতে হয়নি):
+// Auth রুট better-auth নিজে থেকেই এক্সপোজ করে:
 //   POST /api/auth/sign-up/email   → register
 //   POST /api/auth/sign-in/email   → login
 //   POST /api/auth/sign-out        → logout
-//   GET  /api/auth/get-session      → লগইন করা ইউজারের তথ্য
+//   GET  /api/auth/get-session     → লগইন করা ইউজারের তথ্য
 // ================================================================
 
 import express from "express";
@@ -751,7 +746,9 @@ import { notFound, errorHandler } from "./middlewares/errorHandler.js";
 import productRoutes from "./routes/productRoutes.js";
 import cartRoutes from "./routes/cartRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
+import userRoutes from "./routes/userRoutes.js";
 import miscRoutes from "./routes/miscRoutes.js";
+import reviewRoutes from "./routes/reviews.js";
 
 // ----------------------------------------------------------------
 // ENV VALIDATION
@@ -785,7 +782,7 @@ app.all("/api/auth/*splat", toNodeHandler(auth));
 // এর পরে বাকি রুটের জন্য normal JSON parsing
 app.use(express.json({ limit: "1mb" }));
 
-// req.db তে ডাটাবেজ বসিয়ে দেয় (product/cart/order রুটের জন্য)
+// req.db তে ডাটাবেজ বসিয়ে দেয় (product/cart/order/user রুটের জন্য)
 app.use(async (req, res, next) => {
   try {
     req.db = await getDB();
@@ -799,11 +796,16 @@ app.use("/api", apiLimiter);
 
 app.get("/", (req, res) => res.send("It's ok!"));
 
+// ⚠️ সব নির্দিষ্ট রুট এখানে বসবে, notFound/errorHandler-এর *আগে* —
+// নাহলে notFound সব রিকোয়েস্ট এই পর্যন্ত পৌঁছানোর আগেই ধরে ফেলবে
 app.use("/api/products", productRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/orders", orderRoutes);
+app.use("/api/user", userRoutes);
 app.use("/api", miscRoutes); // /api/categories, /api/newsletter
+app.use("/api/reviews", reviewRoutes);
 
+// ⚠️ এই দুটো সবসময় সবার শেষে থাকবে
 app.use(notFound);
 app.use(errorHandler);
 
