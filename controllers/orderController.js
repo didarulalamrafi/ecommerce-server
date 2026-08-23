@@ -1,3 +1,5 @@
+import { ObjectId } from "mongodb";
+
 const DELIVERY_CHARGE = 120;
 
 export async function checkout(req, res) {
@@ -42,16 +44,34 @@ export async function checkout(req, res) {
     };
   }
 
+  // ✅ মাল্টি-ভেন্ডরের জন্য প্রতিটা cart item এর জন্য প্রোডাক্ট থেকে sellerId বের করে বসানো হচ্ছে
+  // (verifyProductOwnerOrAdmin এর মতোই — product.sellerId একটা প্লেইন স্ট্রিং, Better Auth এর user id)
+  const productIds = cart.items.map((i) => new ObjectId(i.productId));
+  const products = await req.db
+    .collection("products")
+    .find({ _id: { $in: productIds } })
+    .toArray();
+
+  const items = cart.items.map((cartItem) => {
+    const product = products.find(
+      (p) => p._id.toString() === cartItem.productId.toString(),
+    );
+    return {
+      ...cartItem,
+      sellerId: product?.sellerId || null,
+      // প্রতিটা আইটেমের নিজস্ব স্ট্যাটাস — যে সেলারের প্রোডাক্ট, শুধু সেই বদলাতে পারবে
+      status: "pending",
+      note: "",
+    };
+  });
+
   // ✅ ডেলিভারি চার্জসহ সাবটোটাল ও গ্র্যান্ড টোটাল হিসাব
-  const subtotal = cart.items.reduce(
-    (sum, item) => sum + item.price * item.qty,
-    0,
-  );
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);
   const total = subtotal + DELIVERY_CHARGE;
 
   const order = {
     userId: req.user.id,
-    items: cart.items,
+    items,
     subtotal,
     deliveryCharge: DELIVERY_CHARGE,
     total,
@@ -64,7 +84,7 @@ export async function checkout(req, res) {
       addressLine: deliveryAddress.addressLine || "",
     },
     payment: paymentInfo,
-    // ✅ সব অর্ডার শুরুতে "pending" — seller approve করলে "approved" হবে
+    // পুরো অর্ডারের overall status — সব আইটেমের status থেকে derive করা, শুরুতে সব "pending"
     status: "pending",
     createdAt: new Date(),
   };
@@ -95,9 +115,8 @@ export async function myOrders(req, res) {
   res.json(orders);
 }
 
-// ---- Seller/Admin ----
+// ---- Admin (whole-order, legacy) ----
 
-// seller/admin এর জন্য সব pending অর্ডার দেখার লিস্ট
 export async function pendingOrders(req, res) {
   if (req.user.role !== "admin" && req.user.role !== "seller") {
     return res.status(403).json({ error: "অনুমতি নেই" });
@@ -117,15 +136,13 @@ export async function pendingOrders(req, res) {
   res.json(orders);
 }
 
-// ✅ seller/admin অর্ডার approve করবে — status "pending" থেকে "approved"
 export async function approveOrder(req, res) {
-  if (req.user.role !== "admin" && req.user.role !== "seller") {
+  if (req.user.role !== "admin") {
+    // ⚠️ আগে "seller" রোলও পারতো, কিন্তু ownership চেক ছিল না — এটা শুধু admin এর জন্য রাখলাম
     return res.status(403).json({ error: "অনুমতি নেই" });
   }
 
-  const { ObjectId } = await import("mongodb");
   const { id } = req.params;
-
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Order id সঠিক নয়" });
   }
@@ -147,15 +164,12 @@ export async function approveOrder(req, res) {
   res.json({ message: "অর্ডার অ্যাপ্রুভ হয়েছে" });
 }
 
-// ✅ চাইলে reject-ও করা যাবে
 export async function rejectOrder(req, res) {
-  if (req.user.role !== "admin" && req.user.role !== "seller") {
+  if (req.user.role !== "admin") {
     return res.status(403).json({ error: "অনুমতি নেই" });
   }
 
-  const { ObjectId } = await import("mongodb");
   const { id } = req.params;
-
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Order id সঠিক নয়" });
   }
@@ -175,4 +189,154 @@ export async function rejectOrder(req, res) {
     return res.status(404).json({ error: "অর্ডার পাওয়া যায়নি" });
   }
   res.json({ message: "অর্ডার রিজেক্ট হয়েছে" });
+}
+
+// ---- Seller (item-level, নতুন) ----
+
+// সব আইটেমের status মিলিয়ে overall order.status ঠিক করার হেল্পার
+function recalcStatus(items) {
+  const statuses = items.map((i) => i.status);
+  if (statuses.every((s) => s === "delivered")) return "delivered";
+  if (statuses.every((s) => s === "cancelled")) return "cancelled";
+  if (statuses.some((s) => s === "pending")) return "pending";
+  return "approved";
+}
+
+// সেলারের নিজের অর্ডার — শুধু নিজের sellerId মেলা আইটেম রেখে বাকিটা ফিল্টার করে দেয়
+export async function mySellerOrders(req, res) {
+  if (req.user.role !== "admin" && req.user.role !== "seller") {
+    return res.status(403).json({ error: "অনুমতি নেই" });
+  }
+
+  const sellerId = req.user.id;
+
+  const orders = await req.db
+    .collection("orders")
+    .find({ "items.sellerId": sellerId })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  // Better Auth ডিফল্টে "user" কালেকশনে স্ট্রিং _id সেভ করে (Mongo ObjectId না)
+  const buyerIds = [...new Set(orders.map((o) => o.userId))];
+  const buyers = await req.db
+    .collection("user")
+    .find({ _id: { $in: buyerIds } })
+    .toArray();
+
+  const result = orders.map((order) => {
+    const buyer = buyers.find((b) => b._id === order.userId);
+    return {
+      ...order,
+      items: order.items.filter((i) => i.sellerId === sellerId),
+      buyer: buyer
+        ? {
+            _id: buyer._id,
+            name: buyer.name,
+            email: buyer.email,
+            phone: buyer.phone,
+          }
+        : null,
+    };
+  });
+
+  res.json(result);
+}
+
+// একটা নির্দিষ্ট আইটেমে সেলারের ownership যাচাই করে অর্ডার+আইটেম রিটার্ন করে
+// permission না থাকলে বা না পাওয়া গেলে নিজেই res পাঠিয়ে null রিটার্ন করে
+async function findOwnedOrderItem(req, res) {
+  const { id, productId } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    res.status(400).json({ error: "Order id সঠিক নয়" });
+    return null;
+  }
+
+  const order = await req.db
+    .collection("orders")
+    .findOne({ _id: new ObjectId(id) });
+  if (!order) {
+    res.status(404).json({ error: "অর্ডার পাওয়া যায়নি" });
+    return null;
+  }
+
+  const item = order.items.find((i) => i.productId.toString() === productId);
+  if (!item) {
+    res.status(404).json({ error: "অর্ডার আইটেম পাওয়া যায়নি" });
+    return null;
+  }
+
+  const isOwner = item.sellerId === req.user.id;
+  const isAdmin = req.user.role === "admin";
+
+  if (!isOwner && !isAdmin) {
+    res.status(403).json({ error: "এই আইটেমে পরিবর্তন করার অনুমতি নেই" });
+    return null;
+  }
+
+  return order;
+}
+
+export async function approveOrderItem(req, res) {
+  const order = await findOwnedOrderItem(req, res);
+  if (!order) return;
+
+  const { productId } = req.params;
+  const items = order.items.map((i) =>
+    i.productId.toString() === productId ? { ...i, status: "approved" } : i,
+  );
+
+  await req.db
+    .collection("orders")
+    .updateOne(
+      { _id: order._id },
+      { $set: { items, status: recalcStatus(items) } },
+    );
+
+  res.json({ message: "আইটেম অ্যাপ্রুভ হয়েছে" });
+}
+
+// নোটসহ ডেলিভারড মার্ক — এই নোট myOrders() এর মাধ্যমে ক্রেতার ড্যাশবোর্ডে দেখা যাবে
+export async function deliverOrderItem(req, res) {
+  const order = await findOwnedOrderItem(req, res);
+  if (!order) return;
+
+  const { productId } = req.params;
+  const { note } = req.body;
+
+  const items = order.items.map((i) =>
+    i.productId.toString() === productId
+      ? { ...i, status: "delivered", note: note || "" }
+      : i,
+  );
+
+  await req.db
+    .collection("orders")
+    .updateOne(
+      { _id: order._id },
+      { $set: { items, status: recalcStatus(items) } },
+    );
+
+  res.json({ message: "আইটেম ডেলিভারড হিসেবে মার্ক হয়েছে" });
+}
+
+// "ডিলিট" — item soft-cancel করে, পুরো order document মোছা হয় না
+// (একই অর্ডারে অন্য সেলারের আইটেম থাকতে পারে)
+export async function cancelOrderItem(req, res) {
+  const order = await findOwnedOrderItem(req, res);
+  if (!order) return;
+
+  const { productId } = req.params;
+  const items = order.items.map((i) =>
+    i.productId.toString() === productId ? { ...i, status: "cancelled" } : i,
+  );
+
+  await req.db
+    .collection("orders")
+    .updateOne(
+      { _id: order._id },
+      { $set: { items, status: recalcStatus(items) } },
+    );
+
+  res.json({ message: "আইটেম বাতিল হয়েছে" });
 }
