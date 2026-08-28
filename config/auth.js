@@ -9,7 +9,7 @@ const IS_PROD = process.env.NODE_ENV === "production";
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 
 export const auth = betterAuth({
-  baseURL: process.env.SERVER_URL || "http://localhost:5000",
+  baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
 
   database: mongodbAdapter(db, { client, transaction: false }),
 
